@@ -4,34 +4,126 @@ mdns.register("wallsocket", {
     description = 'PowerSmart Connector'
 })
 
-function parseHTTP(msg)
-    --Check if its HTTP
-    if(string.match(msg, "HTTP/.%.")==nil) then
-        return nil
-    end
-    
-    local lines = {}
-    local regex = "[^(\r\n)]+"
-    local i = 1
-    for line in string.gmatch(msg, regex) do
-        lines[i] = line
-        i=i+1
-    end
+Buffer = dofile('buffer.lua')
 
-    local req = {}
-    local iter = string.gmatch(lines[1], "[^%s]+")
-    req.method = iter()
-    req.path = iter()
-    req.http = iter()
-
-    req.body = lines[#lines] --temp hack must fix
-    
-    for k, v in pairs( lines ) do
-        print(v)
+HTTPParser = function()
+    local state = 'start'
+    local headerBuffer
+    local bodyBuffer
+    local req
+    return function(msg, conn, callback)
+        if (state == 'start') then
+        	req = {}
+        	headerBuffer = Buffer()
+        	bodyBuffer = Buffer()
+        	if (msg ~= nil) then
+        		--Fill buffer
+        		local headers, body
+        		_,_,headers, body = msg:find("^(.*\r?\n)\r?\n(.*)$")
+        		if (headers == nil) then
+        			headers = msg
+        		end
+		        for line in headers:gmatch(".-\r?\n") do
+		        	print("adding ["..line.."] to buffer.")
+		            headerBuffer.push(line)
+		        end
+		        if(body ~= nil) then
+		        	print("Adding body "..body)
+		        	headerBuffer.push("") --Signal end of headers
+			        bodyBuffer.push(body)
+		        end
+		        msg = nil
+        	end
+        	
+            --Check if its HTTP
+            if (headerBuffer.peek():match("HTTP/%d+%.%d+") ~= nil) then
+                _, _, req.method, req.path, req.http = headerBuffer.next():find("^(.+)%s+(.+)%s+(.+)\r?\n$")
+                state = 'header'
+            else
+            	return nil
+            end
+                 
+        end
+        if(state == 'header') then
+        	if (msg ~= nil) then
+        		--Fill buffer
+        		local headers, body
+        		_,_,headers, body = msg:find("^(.*\r?\n)\r?\n(.*)$")
+        		if (headers == nil) then
+        			headers = msg
+        		end
+		        for line in headers:gmatch(".-\r?\n") do
+		        	print("Adding ["..line.."] to buffer.")
+		            headerBuffer.push(line)
+		        end
+		        if (body ~= nil) then
+		        	print("Adding body "..body)
+		        	headerBuffer.push("") --Signal end of headers
+			        bodyBuffer.push(body)
+		        end
+		        msg = nil --msg consumed
+        	end
+        	
+        	local headers = function ()
+        		if (headerBuffer.peek() == nil) then
+        			return nil
+        		end
+        		if (headerBuffer.peek():match("^\r?\n$") or headerBuffer.peek() == "") then --end of headers
+        			state = 'body'
+        			return nil
+        		end
+                return headerBuffer.next()
+            end
+        	
+        	if (req.headers == nil) then
+        		req.headers = {}
+        	end
+            for header in headers do
+                local key
+                local val
+                --print("Analizing header: "..header)
+                _,_,key,val = header:find("(.-)%s*:%s*(.+)\r?\n$")
+                --print("Found header: "..key..":"..val)
+                if(key ~= nil and val ~= nil) then --discard bad headers
+                	req.headers[key:lower()] = val
+                end
+            end
+        end
+        if(state == 'body') then
+        	if(msg ~= nil) then
+        		bodyBuffer.push(msg)
+        		msg = nil --msg consumed
+        	end
+        	
+        	if (req.body == nil) then
+            	req.body = ''
+            end
+            
+            local body = function()
+                return bodyBuffer.next()
+            end
+            
+            for chunk in body do
+            	req.body = req.body..chunk
+            end
+            
+            --FIX: Send error "411:Needs length" if no content-length
+            if (req.headers['content-length'] == nil) then
+            	state = 'start'
+            	req.body = bodyBuffer.next()
+            	
+            	return callback(conn, req)
+            end
+        	if (req.headers['content-length'] ~= nil and tonumber(req.headers['content-length']) <= req.body:len()) then
+            	--body ends when content-length == req.body:len()
+        		state = 'start'
+        		
+        		return callback(conn, req)
+        	end
+        end
     end
-
-    return req
 end
+
 
 function route(conn, req)
     local res = {
@@ -44,6 +136,14 @@ function route(conn, req)
         res.body = '"Bad Request"'
         respond(conn, res)
         print("Server: Error: Received invalid HTTP request")
+        return
+    end
+    
+    if (req.headers['content-length'] == nil) then
+    	res.status = "411 Length Required"
+        res.body = '"Length Required"'
+        respond(conn, res)
+        print("Server: Error: Needs content length")
         return
     end
     
@@ -132,6 +232,9 @@ routes = {
             elseif req.body == "false" then
                 gpio.mode(3, gpio.OUTPUT)
                 gpio.write(3, 1)
+            else
+                res.status = "400 Bad Request"
+                res.body = '"Request should be of type boolean"'
             end
         end
     },
@@ -151,13 +254,20 @@ routes = {
             elseif req.body == "false" then
                 gpio.mode(4, gpio.OUTPUT)
                 gpio.write(4, 1)
+            else
+                res.status = "404 Bad Request"
+                res.body = '"Request should be of type boolean"'
             end
         end
     }
 }
+
 tcpServer=net.createServer(net.TCP) 
-tcpServer:listen(219,function(conn) 
+tcpServer:listen(219,function(conn)
+    print("Connected to something")
+    local parseHTML = HTTPParser()
     conn:on("receive",function(conn, msg)
-        route(conn, parseHTTP(msg))
+        print("Received data: "..msg)
+        parseHTML(msg, conn, route)
     end) 
 end)
